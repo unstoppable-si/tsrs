@@ -10,19 +10,12 @@ fn run(payload: &Value, flags: &[&str]) -> (i32, Vec<(u8, Value)>) {
 }
 
 fn run_raw(input: &str, flags: &[&str]) -> (i32, Vec<(u8, Value)>) {
-    run_raw_with_threads(input, flags, None)
+    run_raw_with_env(input, flags, &[])
 }
 
-fn run_raw_with_threads(
-    input: &str,
-    flags: &[&str],
-    threads: Option<&str>,
-) -> (i32, Vec<(u8, Value)>) {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_tsrs-lint"));
-    if let Some(threads) = threads {
-        command.env("RAYON_NUM_THREADS", threads);
-    }
-    let mut child = command
+fn run_raw_with_env(input: &str, flags: &[&str], env: &[(&str, &str)]) -> (i32, Vec<(u8, Value)>) {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_tsrs-lint"))
+        .envs(env.iter().copied())
         .arg("headless")
         .args(flags)
         .stdin(Stdio::piped())
@@ -3028,7 +3021,8 @@ fn semantic_reporting_reuses_the_lint_checker_in_serial_and_parallel_runs() {
             for flags in
                 [vec![], vec!["-fix"], vec!["-fix-suggestions"], vec!["-fix", "-fix-suggestions"]]
             {
-                let (status, frames) = run_raw_with_threads(&input, &flags, Some(threads));
+                let (status, frames) =
+                    run_raw_with_env(&input, &flags, &[("RAYON_NUM_THREADS", threads)]);
                 assert_eq!(status, 0, "{frames:?}");
                 for file in &files {
                     let diagnostics: Vec<_> = frames
@@ -6617,11 +6611,13 @@ fn parallel_rules_and_type_checking_match_serial_for_independent_modules() {
         for flags in
             [vec![], vec!["-fix"], vec!["-fix-suggestions"], vec!["-fix", "-fix-suggestions"]]
         {
-            let (serial_status, serial) = run_raw_with_threads(&serial_input, &flags, Some("1"));
+            let (serial_status, serial) =
+                run_raw_with_env(&serial_input, &flags, &[("RAYON_NUM_THREADS", "1")]);
             assert_eq!(serial_status, 0, "{serial:?}");
             assert_ne!(serial, [] as [(u8, tsrs_core::json::Value); 0]);
             for threads in ["1", "2", "4", "8", "12"] {
-                let (status, parallel) = run_raw_with_threads(&input, &flags, Some(threads));
+                let (status, parallel) =
+                    run_raw_with_env(&input, &flags, &[("RAYON_NUM_THREADS", threads)]);
                 assert_eq!(status, 0, "{parallel:?}");
                 assert_eq!(
                     parallel, serial,
@@ -6629,6 +6625,76 @@ fn parallel_rules_and_type_checking_match_serial_for_independent_modules() {
                 );
             }
         }
+    }
+}
+
+#[test]
+fn programs_sharing_a_dependency_lint_the_same_after_earlier_programs_are_freed() {
+    // Each program's regions are freed before the next program, and poison mode fills freed memory, so state that
+    // outlives a program and still points into its regions changes the output or crashes a later program.
+    let base = std::env::current_dir().unwrap().join("target/lint-program-regions");
+    let path = |name: &str| base.join(name).to_string_lossy().into_owned();
+    let mut overrides = JsonMap::default();
+    overrides.insert(
+        path("shared/shared.ts"),
+        Value::String(
+            "/** @deprecated Use another loader. */\nexport async function load(): Promise<number> { return 1; }\n/** A box. */\nexport interface Box { /** Not a promise. */ value: number; loose: any }\n"
+                .into(),
+        ),
+    );
+    let source = format!(
+        "{}\nimport {{ load, type Box }} from '../shared/shared';\nexport async function useShared(box: Box) {{ load(); await box.value; return box.loose.member; }}\n",
+        include_str!("../fixtures/all_rules/a.ts")
+    );
+    let rules: Vec<_> = tsrs_lint::registry::BASELINE_RULES
+        .iter()
+        .copied()
+        .map(|name| protocol::object([("name", Value::String(name.into()))]))
+        .collect();
+    let mut programs = Vec::new();
+    for program in ["p0", "p1", "p2"] {
+        overrides.insert(
+            path(&format!("{program}/tsconfig.json")),
+            Value::String(r#"{"compilerOptions":{"strict":true,"target":"esnext","module":"esnext","moduleResolution":"bundler","lib":["esnext","dom"],"types":[]},"files":["a.ts","b.ts","../shared/shared.ts"]}"#.into()),
+        );
+        let files = ["a.ts", "b.ts"].map(|name| path(&format!("{program}/{name}")));
+        for file in &files {
+            overrides.insert(file.clone(), Value::String(source.clone()));
+        }
+        programs.push(protocol::object([
+            ("file_paths", Value::Array(files.into_iter().map(Value::String).collect())),
+            ("rules", Value::Array(rules.clone())),
+        ]));
+    }
+    let input = |configs: &[Value]| {
+        json::marshal(&protocol::object([
+            ("version", Value::Integer(2)),
+            ("report_semantic", Value::Bool(true)),
+            ("report_syntactic", Value::Bool(true)),
+            ("configs", Value::Array(configs.to_vec())),
+            ("source_overrides", Value::Object(overrides.clone())),
+        ]))
+        .unwrap()
+    };
+    for threads in ["1", "2"] {
+        let mut alone = Vec::new();
+        for program in &programs {
+            let (status, frames) = run_raw_with_env(
+                &input(std::slice::from_ref(program)),
+                &[],
+                &[("RAYON_NUM_THREADS", threads)],
+            );
+            assert_eq!(status, 0, "{frames:?}");
+            assert_ne!(frames, [] as [(u8, Value); 0]);
+            alone.extend(frames);
+        }
+        let (status, together) = run_raw_with_env(
+            &input(&programs),
+            &[],
+            &[("RAYON_NUM_THREADS", threads), ("TSRS_ARENA_POISON", "1")],
+        );
+        assert_eq!(status, 0, "{together:?}");
+        assert_eq!(together, alone, "threads={threads}");
     }
 }
 
