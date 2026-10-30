@@ -131,10 +131,8 @@ pub fn run(
     let fs: Arc<dyn FS> = Arc::new(bundled::wrap_fs(cachedvfs::from(Arc::new(fs))));
     let host = ConfigHost::new(Arc::clone(&fs), cwd.into());
     let region = tsrs_core::arena::Region::new_scratch(1 << 20);
-    // Shared caches can receive worker allocations, so every worker region outlives every request program.
-    let mut regions = RequestRegions::default();
     let _scope = region.enter();
-    run_in_region(payload, options, cwd, writer, fs, &host, &mut regions)
+    run_in_region(payload, options, cwd, writer, fs, &host)
 }
 
 struct ProgramOwner(&'static Program);
@@ -155,7 +153,6 @@ fn run_in_region(
     writer: &mut dyn Write,
     fs: Arc<dyn FS>,
     host: &ConfigHost,
-    regions: &mut RequestRegions,
 ) -> Result<(), String> {
     let mut programs: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut unmatched = Vec::new();
@@ -182,6 +179,11 @@ fn run_in_region(
     }
     drop(config_cache);
     for (config_path, files) in programs {
+        // Each program's loader and worker regions are freed right after the program (they are declared first, so
+        // they are dropped after it), so a request holds one program's checkers at a time rather than every
+        // program's. Nothing that outlives a program points into them: process-wide caches allocate in thread
+        // arenas (notes/mem-tsgolint-program-regions.md).
+        let mut regions = RequestRegions::default();
         let (config, diagnostics) = tsrs_tsoptions::get_parsed_command_line_of_config_file(
             &config_path,
             None,
@@ -229,6 +231,7 @@ fn run_in_region(
         )?;
     }
     if !unmatched.is_empty() {
+        let mut regions = RequestRegions::default();
         let config = tsrs_tsoptions::new_parsed_command_line(
             P::new(CompilerOptions {
                 allow_js: Tristate::True,
